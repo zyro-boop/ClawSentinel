@@ -12,8 +12,10 @@ dotenv.config();
 
 const BLUESMINDS_BASE = process.env.BLUESMINDS_BASE || 'https://api.bluesminds.com/v1';
 const BLUESMINDS_API_KEY = process.env.BLUESMINDS_API_KEY || '';
-const APP_ACCESS_CODE = process.env.APP_ACCESS_CODE || 'ClawSentinel123!';
+const APP_ACCESS_CODE = process.env.APP_ACCESS_CODE;
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-claw-key';
+const AVE_API_KEY = process.env.AVE_API_KEY || '';
+const AVE_BASE = 'https://prod.ave-api.com/v2';
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_DEFAULT_CHAT_ID = process.env.TELEGRAM_DEFAULT_CHAT_ID || '';
@@ -43,10 +45,31 @@ if (TELEGRAM_BOT_TOKEN) {
     const db = readDB();
     db.telegramChatId = chatId.toString();
     writeDB(db);
-    bot?.sendMessage(chatId, 'Welcome to ClawSentinel! You will now receive alerts here.');
+    bot?.sendMessage(chatId, '✅ Welcome to ClawSentinel! You will now receive alerts here.');
   });
 }
 
+// --- AVE API Helper ---
+async function aveGet(endpoint: string, params: Record<string, string> = {}) {
+  const url = new URL(`${AVE_BASE}${endpoint}`);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.append(k, v));
+  
+  const res = await fetch(url.toString(), {
+    headers: {
+      'X-API-KEY': AVE_API_KEY,
+      'Content-Type': 'application/json'
+    }
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`AVE API error: ${err}`);
+  }
+
+  return res.json();
+}
+
+// --- BluesMinds Setup ---
 let selectedModel = '';
 
 async function initializeBluesMinds() {
@@ -62,7 +85,10 @@ async function initializeBluesMinds() {
     const data = await res.json();
     
     const models = data.data || [];
-    const kimi25 = models.find((m: any) => m.id.toLowerCase().includes('kimi-2.5') || m.id.toLowerCase() === 'kimi-2.5');
+    const kimi25 = models.find((m: any) => 
+      m.id.toLowerCase().includes('kimi-2.5') || 
+      m.id.toLowerCase() === 'kimi-2.5'
+    );
     
     if (kimi25) {
       selectedModel = kimi25.id;
@@ -103,25 +129,55 @@ async function callBluesMinds(messages: any[], temperature = 0.7) {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
   app.use(cors());
   app.use(express.json());
   app.use(cookieParser());
 
+  console.log(`[DEBUG] APP_ACCESS_CODE defined: ${!!process.env.APP_ACCESS_CODE}`);
+  console.log(`[DEBUG] AVE_API_KEY defined: ${!!AVE_API_KEY}`);
+  console.log(`[DEBUG] NODE_ENV: ${process.env.NODE_ENV}`);
+
   initializeBluesMinds();
 
-  // --- API ROUTES ---
+  // --- HEALTH CHECK ---
   app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      ave: !!AVE_API_KEY,
+      ai: !!BLUESMINDS_API_KEY,
+      telegram: !!TELEGRAM_BOT_TOKEN
+    });
   });
 
   // --- AUTH ROUTES ---
   app.post('/api/auth/verify', (req, res) => {
     const { code } = req.body;
-    if (code === APP_ACCESS_CODE) {
+    
+    let envCode = process.env.APP_ACCESS_CODE;
+    if (envCode) {
+      envCode = envCode.trim();
+      if ((envCode.startsWith('"') && envCode.endsWith('"')) || 
+          (envCode.startsWith("'") && envCode.endsWith("'"))) {
+        envCode = envCode.slice(1, -1);
+      }
+    }
+
+    const submittedCode = typeof code === 'string' ? code.trim() : '';
+    const isMatched = !!(envCode && submittedCode === envCode);
+    
+    console.log(`[DEBUG] Auth Verify: Code matched: ${isMatched}`);
+
+    if (isMatched) {
       const token = jwt.sign({ authenticated: true }, JWT_SECRET, { expiresIn: '7d' });
-      res.cookie('auth_token', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict' });
+      res.cookie('auth_token', token, { 
+        httpOnly: true, 
+        secure: process.env.NODE_ENV === 'production', 
+        sameSite: 'lax',
+        path: '/'
+      });
       res.json({ success: true });
     } else {
       res.status(401).json({ error: 'Invalid access code' });
@@ -164,30 +220,88 @@ async function startServer() {
     }
   });
 
-  // Mocking real Ave API / Market Data for the frontend
+  // --- MARKET ROUTES (AVE API) ---
+
+  // Trending Tokens
   app.get('/api/market/trending', async (req, res) => {
     try {
-      const response = await fetch('https://api.dexscreener.com/latest/dex/search?q=ETH');
-      const data = await response.json();
+      const chain = (req.query.chain as string) || 'eth';
+      const data = await aveGet('/tokens/trending', { chain });
       res.json(data);
     } catch (error) {
-      console.error('Error fetching trending data:', error);
-      res.status(500).json({ error: 'Failed to fetch trending data' });
+      console.error('Error fetching trending:', error);
+      // Fallback to DexScreener
+      try {
+        const response = await fetch('https://api.dexscreener.com/latest/dex/search?q=ETH');
+        const data = await response.json();
+        res.json(data);
+      } catch (e) {
+        res.status(500).json({ error: 'Failed to fetch trending data' });
+      }
     }
   });
 
+  // Token Data by Address
   app.get('/api/market/token/:address', async (req, res) => {
     try {
-      const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${req.params.address}`);
-      const data = await response.json();
+      const { address } = req.params;
+      const chain = (req.query.chain as string) || 'eth';
+      const data = await aveGet('/token', { address, chain });
       res.json(data);
     } catch (error) {
-      console.error('Error fetching token data:', error);
-      res.status(500).json({ error: 'Failed to fetch token data' });
+      console.error('Error fetching token:', error);
+      // Fallback to DexScreener
+      try {
+        const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${req.params.address}`);
+        const data = await response.json();
+        res.json(data);
+      } catch (e) {
+        res.status(500).json({ error: 'Failed to fetch token data' });
+      }
     }
   });
 
-  // AI Summary Route
+  // Token Chart/Klines
+  app.get('/api/market/chart/:address', async (req, res) => {
+    try {
+      const { address } = req.params;
+      const chain = (req.query.chain as string) || 'eth';
+      const interval = (req.query.interval as string) || '1h';
+      const data = await aveGet('/klines', { address, chain, interval });
+      res.json(data);
+    } catch (error) {
+      console.error('Error fetching chart:', error);
+      res.status(500).json({ error: 'Failed to fetch chart data' });
+    }
+  });
+
+  // Token Holders
+  app.get('/api/market/holders/:address', async (req, res) => {
+    try {
+      const { address } = req.params;
+      const chain = (req.query.chain as string) || 'eth';
+      const data = await aveGet('/token/holders', { address, chain });
+      res.json(data);
+    } catch (error) {
+      console.error('Error fetching holders:', error);
+      res.status(500).json({ error: 'Failed to fetch holders data' });
+    }
+  });
+
+  // Token Transactions
+  app.get('/api/market/transactions/:address', async (req, res) => {
+    try {
+      const { address } = req.params;
+      const chain = (req.query.chain as string) || 'eth';
+      const data = await aveGet('/token/transactions', { address, chain });
+      res.json(data);
+    } catch (error) {
+      console.error('Error fetching transactions:', error);
+      res.status(500).json({ error: 'Failed to fetch transactions' });
+    }
+  });
+
+  // --- AI ROUTES ---
   app.post('/api/ai/analyze', async (req, res) => {
     try {
       const { context, type } = req.body;
@@ -205,7 +319,6 @@ async function startServer() {
       
       if (type === 'deep_dive') {
         try {
-          // Extract JSON if wrapped in markdown
           const jsonMatch = summary.match(/```json\n([\s\S]*?)\n```/) || summary.match(/\{[\s\S]*\}/);
           if (jsonMatch) {
             summary = JSON.parse(jsonMatch[1] || jsonMatch[0]);
@@ -213,7 +326,6 @@ async function startServer() {
             summary = JSON.parse(summary);
           }
         } catch (e) {
-          // Fallback if parsing fails
           summary = {
             confidence: 85,
             findings: ["Analysis completed.", "Data processed.", "Awaiting further signals."],
@@ -230,7 +342,6 @@ async function startServer() {
     }
   });
 
-  // AI Chat Route
   app.post('/api/ai/chat', async (req, res) => {
     try {
       const { messages, context } = req.body;
@@ -255,7 +366,7 @@ ${JSON.stringify(context, null, 2)}`;
     }
   });
 
-  // --- VITE MIDDLEWARE ---
+  // --- VITE / STATIC ---
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -271,7 +382,7 @@ ${JSON.stringify(context, null, 2)}`;
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
   });
 }
 
