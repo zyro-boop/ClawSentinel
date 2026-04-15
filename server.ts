@@ -16,7 +16,6 @@ const APP_ACCESS_CODE = process.env.APP_ACCESS_CODE;
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-claw-key';
 const AVE_API_KEY = process.env.AVE_API_KEY || '';
 const AVE_BASE = 'https://prod.ave-api.com/v2';
-
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_DEFAULT_CHAT_ID = process.env.TELEGRAM_DEFAULT_CHAT_ID || '';
 
@@ -36,45 +35,36 @@ function writeDB(data: any) {
   fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
-// --- Telegram Bot Setup ---
+// --- Telegram Bot (No Polling) ---
 let bot: TelegramBot | null = null;
 if (TELEGRAM_BOT_TOKEN) {
-  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-  bot.onText(/\/start clawsentinel/, (msg) => {
-    const chatId = msg.chat.id;
-    const db = readDB();
-    db.telegramChatId = chatId.toString();
-    writeDB(db);
-    bot?.sendMessage(chatId, '✅ Welcome to ClawSentinel! You will now receive alerts here.');
-  });
+  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+  console.log('[Telegram] Bot initialized');
 }
 
 // --- AVE API Helper ---
 async function aveGet(endpoint: string, params: Record<string, string> = {}) {
   const url = new URL(`${AVE_BASE}${endpoint}`);
   Object.entries(params).forEach(([k, v]) => url.searchParams.append(k, v));
-  
   const res = await fetch(url.toString(), {
     headers: {
       'X-API-KEY': AVE_API_KEY,
       'Content-Type': 'application/json'
     }
   });
-
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`AVE API error: ${err}`);
   }
-
   return res.json();
 }
 
-// --- BluesMinds Setup ---
+// --- BluesMinds AI ---
 let selectedModel = '';
 
 async function initializeBluesMinds() {
   if (!BLUESMINDS_API_KEY) {
-    console.warn('BLUESMINDS_API_KEY is not set. AI features will fail.');
+    console.warn('[BluesMinds] API key not set');
     return;
   }
   try {
@@ -83,13 +73,11 @@ async function initializeBluesMinds() {
     });
     if (!res.ok) throw new Error(`Failed to fetch models: ${res.statusText}`);
     const data = await res.json();
-    
     const models = data.data || [];
-    const kimi25 = models.find((m: any) => 
-      m.id.toLowerCase().includes('kimi-2.5') || 
+    const kimi25 = models.find((m: any) =>
+      m.id.toLowerCase().includes('kimi-2.5') ||
       m.id.toLowerCase() === 'kimi-2.5'
     );
-    
     if (kimi25) {
       selectedModel = kimi25.id;
     } else if (models.length > 0) {
@@ -104,25 +92,18 @@ async function initializeBluesMinds() {
 async function callBluesMinds(messages: any[], temperature = 0.7) {
   if (!selectedModel) await initializeBluesMinds();
   if (!selectedModel) throw new Error('No BluesMinds model available');
-
   const res = await fetch(`${BLUESMINDS_BASE}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${BLUESMINDS_API_KEY}`
     },
-    body: JSON.stringify({
-      model: selectedModel,
-      messages,
-      temperature
-    })
+    body: JSON.stringify({ model: selectedModel, messages, temperature })
   });
-
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`BluesMinds API error: ${err}`);
   }
-
   const data = await res.json();
   return data.choices[0].message.content;
 }
@@ -143,8 +124,8 @@ async function startServer() {
 
   // --- HEALTH CHECK ---
   app.get('/api/health', (req, res) => {
-    res.json({ 
-      status: 'ok', 
+    res.json({
+      status: 'ok',
       timestamp: new Date().toISOString(),
       ave: !!AVE_API_KEY,
       ai: !!BLUESMINDS_API_KEY,
@@ -155,26 +136,22 @@ async function startServer() {
   // --- AUTH ROUTES ---
   app.post('/api/auth/verify', (req, res) => {
     const { code } = req.body;
-    
     let envCode = process.env.APP_ACCESS_CODE;
     if (envCode) {
       envCode = envCode.trim();
-      if ((envCode.startsWith('"') && envCode.endsWith('"')) || 
-          (envCode.startsWith("'") && envCode.endsWith("'"))) {
+      if ((envCode.startsWith('"') && envCode.endsWith('"')) ||
+        (envCode.startsWith("'") && envCode.endsWith("'"))) {
         envCode = envCode.slice(1, -1);
       }
     }
-
     const submittedCode = typeof code === 'string' ? code.trim() : '';
     const isMatched = !!(envCode && submittedCode === envCode);
-    
     console.log(`[DEBUG] Auth Verify: Code matched: ${isMatched}`);
-
     if (isMatched) {
       const token = jwt.sign({ authenticated: true }, JWT_SECRET, { expiresIn: '7d' });
-      res.cookie('auth_token', token, { 
-        httpOnly: true, 
-        secure: process.env.NODE_ENV === 'production', 
+      res.cookie('auth_token', token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
         sameSite: 'lax',
         path: '/'
       });
@@ -220,17 +197,28 @@ async function startServer() {
     }
   });
 
-  // --- MARKET ROUTES (AVE API) ---
+  // Telegram Webhook
+  app.post('/api/telegram/webhook', (req, res) => {
+    if (!bot) return res.sendStatus(400);
+    const { message } = req.body;
+    if (message?.text?.includes('/start clawsentinel')) {
+      const chatId = message.chat.id;
+      const db = readDB();
+      db.telegramChatId = chatId.toString();
+      writeDB(db);
+      bot.sendMessage(chatId, '✅ Welcome to ClawSentinel! You will now receive alerts here.');
+    }
+    res.sendStatus(200);
+  });
 
-  // Trending Tokens
+  // --- MARKET ROUTES (AVE API) ---
   app.get('/api/market/trending', async (req, res) => {
     try {
       const chain = (req.query.chain as string) || 'eth';
       const data = await aveGet('/tokens/trending', { chain });
       res.json(data);
     } catch (error) {
-      console.error('Error fetching trending:', error);
-      // Fallback to DexScreener
+      console.error('AVE trending error, falling back:', error);
       try {
         const response = await fetch('https://api.dexscreener.com/latest/dex/search?q=ETH');
         const data = await response.json();
@@ -241,7 +229,6 @@ async function startServer() {
     }
   });
 
-  // Token Data by Address
   app.get('/api/market/token/:address', async (req, res) => {
     try {
       const { address } = req.params;
@@ -249,8 +236,7 @@ async function startServer() {
       const data = await aveGet('/token', { address, chain });
       res.json(data);
     } catch (error) {
-      console.error('Error fetching token:', error);
-      // Fallback to DexScreener
+      console.error('AVE token error, falling back:', error);
       try {
         const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${req.params.address}`);
         const data = await response.json();
@@ -261,7 +247,6 @@ async function startServer() {
     }
   });
 
-  // Token Chart/Klines
   app.get('/api/market/chart/:address', async (req, res) => {
     try {
       const { address } = req.params;
@@ -275,7 +260,6 @@ async function startServer() {
     }
   });
 
-  // Token Holders
   app.get('/api/market/holders/:address', async (req, res) => {
     try {
       const { address } = req.params;
@@ -288,7 +272,6 @@ async function startServer() {
     }
   });
 
-  // Token Transactions
   app.get('/api/market/transactions/:address', async (req, res) => {
     try {
       const { address } = req.params;
@@ -305,7 +288,6 @@ async function startServer() {
   app.post('/api/ai/analyze', async (req, res) => {
     try {
       const { context, type } = req.body;
-      
       let prompt = '';
       if (type === 'dashboard_risk') {
         prompt = `You are an expert on-chain risk analyst. Analyze the following market context and provide a brief, professional risk verdict (max 2 sentences) focusing on liquidity, volume shifts, and smart contract anomalies. Context: ${JSON.stringify(context)}`;
@@ -314,9 +296,7 @@ async function startServer() {
       } else {
         prompt = `Analyze the following on-chain data: ${JSON.stringify(context)}`;
       }
-
       let summary = await callBluesMinds([{ role: 'user', content: prompt }]);
-      
       if (type === 'deep_dive') {
         try {
           const jsonMatch = summary.match(/```json\n([\s\S]*?)\n```/) || summary.match(/\{[\s\S]*\}/);
@@ -334,7 +314,6 @@ async function startServer() {
           };
         }
       }
-
       res.json({ summary });
     } catch (error) {
       console.error('Error generating AI summary:', error);
@@ -345,19 +324,15 @@ async function startServer() {
   app.post('/api/ai/chat', async (req, res) => {
     try {
       const { messages, context } = req.body;
-      
       const systemPrompt = `You are the ClawSentinel AI Analyst. You help users understand on-chain risk, token metrics, and market events.
 Keep your answers concise, professional, and grounded in the provided context. Do NOT invent data.
 If the user asks about something not in the context, politely state that you don't have that data currently.
-
 Current Context:
 ${JSON.stringify(context, null, 2)}`;
-
       const fullMessages = [
         { role: 'system', content: systemPrompt },
         ...messages
       ];
-
       const reply = await callBluesMinds(fullMessages);
       res.json({ reply });
     } catch (error) {
