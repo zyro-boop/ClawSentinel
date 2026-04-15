@@ -110,12 +110,13 @@ async function callBluesMinds(messages: any[], temperature = 0.7) {
 
 async function startServer() {
   const app = express();
-  const PORT = parseInt(process.env.PORT || '8080');
+  const PORT = parseInt(process.env.PORT || '3000');
 
   app.use(cors());
   app.use(express.json());
   app.use(cookieParser());
 
+  console.log(`[DEBUG] PORT: ${PORT}`);
   console.log(`[DEBUG] APP_ACCESS_CODE defined: ${!!process.env.APP_ACCESS_CODE}`);
   console.log(`[DEBUG] AVE_API_KEY defined: ${!!AVE_API_KEY}`);
   console.log(`[DEBUG] NODE_ENV: ${process.env.NODE_ENV}`);
@@ -197,7 +198,6 @@ async function startServer() {
     }
   });
 
-  // Telegram Webhook
   app.post('/api/telegram/webhook', (req, res) => {
     if (!bot) return res.sendStatus(400);
     const { message } = req.body;
